@@ -1059,6 +1059,10 @@ func TestUpdateValidatorCommission(t *testing.T) {
 	app, ctx, _, addrVals := bootstrapValidatorTest(t, 1000, 20)
 	ctx = ctx.WithBlockHeader(tmproto.Header{Time: time.Now().UTC()})
 
+	params := app.StakingKeeper.GetParams(ctx)
+	params.MinCommissionRate = sdk.MustNewDecFromStr("0.05")
+	app.StakingKeeper.SetParams(ctx, params)
+
 	commission1 := types.NewCommissionWithTime(
 		sdk.NewDecWithPrec(1, 1), sdk.NewDecWithPrec(3, 1),
 		sdk.NewDecWithPrec(1, 1), time.Now().UTC().Add(time.Duration(-1)*time.Hour),
@@ -1083,6 +1087,7 @@ func TestUpdateValidatorCommission(t *testing.T) {
 		{val2, sdk.NewDecWithPrec(-1, 1), true},
 		{val2, sdk.NewDecWithPrec(4, 1), true},
 		{val2, sdk.NewDecWithPrec(3, 1), true},
+		{val2, sdk.NewDecWithPrec(1, 2), true}, // Commission rate below minimum
 		{val2, sdk.NewDecWithPrec(2, 1), false},
 	}
 
@@ -1110,6 +1115,61 @@ func TestUpdateValidatorCommission(t *testing.T) {
 			)
 		}
 	}
+}
+
+func TestMustUpdateValidatorCommission(t *testing.T) {
+	app, ctx, _, addrVals := bootstrapValidatorTest(t, 1000, 20)
+	ctx = ctx.WithBlockHeader(tmproto.Header{Time: time.Now().UTC()})
+
+	params := app.StakingKeeper.GetParams(ctx)
+	params.MinCommissionRate = sdk.MustNewDecFromStr("0.05") // 5%
+	app.StakingKeeper.SetParams(ctx, params)
+
+	// TC1: Check if commission-rate is updated ignoring max-change-rate
+	val1 := teststaking.NewValidator(t, addrVals[0], PKs[0])
+	val1, _ = val1.SetInitialCommission(types.NewCommission(
+		sdk.MustNewDecFromStr("0.01"), // rate
+		sdk.MustNewDecFromStr("0.10"), // max-rate
+		sdk.MustNewDecFromStr("0.01"), // max-change-rate
+	))
+	app.StakingKeeper.SetValidator(ctx, val1)
+
+	commission, err := app.StakingKeeper.MustUpdateValidatorCommission(ctx, val1, params.MinCommissionRate)
+	require.NoError(t, err)
+	require.Equal(t, params.MinCommissionRate, commission.Rate)
+	require.Equal(t, val1.Commission.MaxRate, commission.MaxRate)
+	require.Equal(t, val1.Commission.MaxChangeRate, commission.MaxChangeRate)
+
+	// TC1-1: Check errors if commission-rate is invalid
+	_, err = app.StakingKeeper.MustUpdateValidatorCommission(ctx, val1, sdk.MustNewDecFromStr("-0.1")) // negative
+	require.Error(t, err)
+	_, err = app.StakingKeeper.MustUpdateValidatorCommission(ctx, val1, sdk.MustNewDecFromStr("1.1")) // > 100%
+	require.Error(t, err)
+	_, err = app.StakingKeeper.MustUpdateValidatorCommission(ctx, val1, sdk.MustNewDecFromStr("0.04")) // < min-commission-rate
+	require.Error(t, err)
+
+	// TC2: Check if commission-rate is updated ignoring max-rate. Then, max-rate must be updated as well.
+	val2 := teststaking.NewValidator(t, addrVals[1], PKs[1])
+	val2, _ = val2.SetInitialCommission(types.NewCommission(
+		sdk.MustNewDecFromStr("0.01"), // rate
+		sdk.MustNewDecFromStr("0.02"), // max-rate
+		sdk.MustNewDecFromStr("0.01"), // max-change-rate
+	))
+	app.StakingKeeper.SetValidator(ctx, val2)
+
+	commission, err = app.StakingKeeper.MustUpdateValidatorCommission(ctx, val2, params.MinCommissionRate)
+	require.NoError(t, err)
+	require.Equal(t, params.MinCommissionRate, commission.Rate)
+	require.Equal(t, commission.Rate.MulInt64(2), commission.MaxRate)
+	require.Equal(t, val2.Commission.MaxChangeRate, commission.MaxChangeRate)
+
+	// TC2-1: Check if max-rate is updated to 100%, when new-rate is larger than 50% and max-rate was smaller than new-rate.
+	newRate := sdk.MustNewDecFromStr("0.6")
+	commission, err = app.StakingKeeper.MustUpdateValidatorCommission(ctx, val2, newRate)
+	require.NoError(t, err)
+	require.Equal(t, newRate, commission.Rate)
+	require.Equal(t, sdk.OneDec(), commission.MaxRate)
+	require.Equal(t, val2.Commission.MaxChangeRate, commission.MaxChangeRate)
 }
 
 func applyValidatorSetUpdates(t *testing.T, ctx sdk.Context, k keeper.Keeper, expectedUpdatesLen int) []abci.ValidatorUpdate {
